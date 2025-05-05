@@ -6,14 +6,19 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import NetworkError, RetryAfter
 from g4f.client import Client 
+from g4f.client import AsyncClient
 import g4f.Provider 
 import g4f.models
 from g4f.Provider import RetryProvider
+from g4f.Provider import BlackForestLabs_Flux1Schnell
 from google import genai
 from google.genai import types
 import PIL.Image
 import base64
 from io import BytesIO
+import requests
+import json
+from gradio_client import Client as GradioClient
 
 
 # Configure logging
@@ -50,11 +55,11 @@ MODELS = [
 
 IMAGE_MODELS = [
     "flux"
-    "flux-pro",
-    "flux-dev",
-    "flux-schnell",
-    "midjourney",
-    "dall-e-3"
+    # "flux-pro",
+    # "flux-dev",
+    # "flux-schnell",
+    # "flux",
+    # "dall-e-3"
 ]
 
 # Initialize g4f client
@@ -550,6 +555,58 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup
         )
 
+async def generate_image_huggingface(prompt: str) -> str:
+    """Generate image using Gradio client"""
+    try:
+        logger.info("Initializing Gradio client...")
+        client = GradioClient(
+            "Asahina2k/animagine-xl-4.0",
+            hf_token=os.getenv('HUGGINGFACE_API_KEY')
+        )
+        
+        # Initialize API
+        logger.info("Initializing API...")
+        client.predict(api_name="/lambda")
+        
+        # Generate image
+        logger.info(f"Generating image with prompt: {prompt}")
+        fixed_prompt = prompt + ",masterpiece, high score, great score, absurdre"
+        result = client.predict(
+            prompt=fixed_prompt,
+            negative_prompt="lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",
+            seed=0,
+            custom_width=1024,
+            custom_height=1024,
+            guidance_scale=5,
+            num_inference_steps=28,
+            sampler="Euler a",
+            aspect_ratio_selector="832 x 1216",
+            style_selector="(None)",
+            use_upscaler=False,
+            upscaler_strength=0.55,
+            upscale_by=1.5,
+            add_quality_tags=True,
+            api_name="/generate"
+        )
+        
+        # Finalize
+        logger.info("Finalizing generation...")
+        client.predict(api_name="/lambda_1")
+        
+        # result[0] contains the list of generated images
+        if result and len(result) > 0 and result[0]:
+            image_data = result[0][0]['image']  # Get the first image
+            logger.info("Image generated successfully!")
+            return image_data  # This will be the path to the generated image
+        else:
+            raise Exception("No image generated")
+            
+    except Exception as e:
+        logger.error(f"Error generating image: {str(e)}")
+        if "timeout" in str(e).lower():
+            logger.error("SSL handshake timeout. This might be due to network issues or proxy settings.")
+        raise Exception(f"Failed to generate image: {str(e)}")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages and respond using GPT or generate images."""
     try:
@@ -567,6 +624,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if update.message.text == "Общаться":
                 user_states[user_id]["mode"] = "chat"
                 user_states[user_id]["conversation"] = Conversation()  # Reset conversation
+                
                 await update.message.reply_text(
                     "Отправьте мне любое сообщение, и я отвечу вам с помощью GPT! ⚠️ При повторном нажатии на кнопку 'Общаться' память будет очищена, и будет начат новый чат.",
                     reply_markup=reply_markup
@@ -574,6 +632,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             elif update.message.text == "Сгенерировать изображение":
                 user_states[user_id]["mode"] = "image"
+                # user_states[user_id]["image_client"] = AsyncClient(
+                #     provider=BlackForestLabs_Flux1Schnell,
+                #     api_key=os.getenv('HUGGINGFACE_API_KEY')
+                # )  # Store client in user_states
                 await update.message.reply_text(
                     "Отправьте мне описание изображения, которое вы хотите создать.⚠️",
                     reply_markup=reply_markup
@@ -588,19 +650,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Handle image generation
         if user_states[user_id]["mode"] == "image":
             try:
-                logger.info("Generating image using flux model")
-                response = client.images.generate(
-                    model="flux",
-                    prompt=update.message.text,
-                    response_format="url"
-                )
+                logger.info("Generating image using Gradio client")
+                image_path = await generate_image_huggingface(update.message.text)
                 
-                if response and response.data and response.data[0].url:
-                    image_url = response.data[0].url
-                    logger.info("Successfully generated image")
-                    await update.message.reply_photo(image_url, reply_markup=reply_markup)
-                else:
-                    raise Exception("No image URL in response")
+                # Send the generated image
+                with open(image_path, 'rb') as photo:
+                    await update.message.reply_photo(photo, reply_markup=reply_markup)
+                
+                # Clean up
+                try:
+                    os.remove(image_path)
+                except Exception as e:
+                    logger.error(f"Error removing temporary file: {e}")
                     
             except Exception as e:
                 logger.error(f"Error generating image: {e}")
