@@ -19,6 +19,7 @@ from io import BytesIO
 import requests
 import json
 from gradio_client import Client as GradioClient
+import subprocess
 
 
 # Configure logging
@@ -175,7 +176,7 @@ sysprompt_chat = [{
 
 ## <Материал 4: Формат ответа>;
 В конце каждого ответа пиши:
-1. Сцена: (описание текущей сцены, действия, а также описание внешнего вида Анастасии и Пользователя. Описания внешнего вида должны быть относительно подробными, включающими в себя одежду и позу. Если внешний вид персонажа по какой-то причине начал отличается от оригинального, то описывай изменённый внешний вид более подробно.)
+1. Сцена: (описание текущей сцены, действия, а также описание внешнего вида Анастасии и Пользователя. Описания внешнего вида должны быть относительно подробными, включающими в себя одежду и позу. Если внешний вид персонажа по какой-то причине начал отличаться от оригинального, то описывай изменённый внешний вид более подробно.)
 2. Внушения: (лист существующих внушений. Если их нет, то оставь поле пустым.).
 (Не забывай их и не сокращай, если не попросит пользователь.)
 
@@ -230,7 +231,11 @@ class Conversation:
         # Store system prompt separately
         self.system_prompt = sysprompt_chat 
         # Initialize history with system prompt
-        self.history = self.system_prompt.copy()
+        # self.history = self.system_prompt.copy()
+        self.history = [{
+            "role": "system",
+            "content": "Alex is coming in classroom."
+            }]
         # Maximum number of messages to keep (excluding system prompt)
         self.max_messages = 30
         # Flag to track if summary suggestion was sent
@@ -247,6 +252,8 @@ class Conversation:
         
         # Log current history size
         logger.info(f"Messages in history: {len(self.history)}")
+        for item in self.history:
+            logger.info(item)
         
         # If we exceed max_messages, remove only the oldest non-system message
         if len(self.history) > len(self.system_prompt) + self.max_messages:
@@ -283,19 +290,17 @@ class Conversation:
         self.add_message("user", user_message)
         
         # Convert history to Google's format
-        google_messages = []
+        history_text = ""
         for msg in self.history:
             if msg["role"] == "system":
-                continue  # Skip system prompt as it's handled separately
-            google_messages.append({
-                "role": msg["role"],
-                "parts": [{"text": msg["content"]}]
-            })
+                continue
+            role = "user" if msg["role"] == "user" else "assistant"
+            history_text += f"{role}: {msg['content']}\n"
         
         # Get response from Google's AI
         response = client.models.generate_content(
             model=model,
-            contents=google_messages,
+            contents=history_text,
             config=types.GenerateContentConfig(
                 system_instruction=self.system_prompt[0]["content"],
                 safety_settings=[
@@ -335,16 +340,27 @@ class Conversation:
     def get_response_with_image(self, image_path: str, user_message: str, model: str) -> str:
         """Get response from Google's AI with image analysis."""
         # Add user message to history
-        image_message = "user показал изображение/n" + user_message
+        image_message = "user показал изображение и сказал:/n" + user_message
         self.add_message("user", image_message)
         
         # Create content with image and text
         image = PIL.Image.open(image_path)
         
+        # Формируем историю в виде текста
+        history_text = ""
+        for msg in self.history:
+            if msg["role"] == "system":
+                continue
+            role = "user" if msg["role"] == "user" else "assistant"
+            history_text += f"{role}: {msg['content']}\n"
+        
+        # Добавляем текущее сообщение с изображением
+        current_message = f"Пользователь показал изображение и сказал: {user_message}"
+        
         # Get response from Google's AI
         response = client.models.generate_content(
             model=model,
-            contents=[image,user_message],
+            contents=[history_text + "\n" + current_message, image],
             config=types.GenerateContentConfig(
                 system_instruction=self.system_prompt[0]["content"],
                 safety_settings=[
@@ -610,6 +626,11 @@ async def generate_image_huggingface(prompt: str) -> str:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages and respond using GPT or generate images."""
     try:
+        # Start typing action that will continue until we send a response
+        typing_task = asyncio.create_task(
+            update.message.chat.send_action(action="typing")
+        )
+        
         user_id = update.effective_user.id
         
         # Initialize user state if not exists
@@ -629,6 +650,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Отправьте мне любое сообщение, и я отвечу вам с помощью GPT! ⚠️ При повторном нажатии на кнопку 'Общаться' память будет очищена, и будет начат новый чат.",
                     reply_markup=reply_markup
                 )
+                typing_task.cancel()
                 return
             elif update.message.text == "Сгенерировать изображение":
                 user_states[user_id]["mode"] = "image"
@@ -640,12 +662,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Отправьте мне описание изображения, которое вы хотите создать.⚠️",
                     reply_markup=reply_markup
                 )
+                typing_task.cancel()
                 return
-        
-        # Start typing action that will continue until we send a response
-        typing_task = asyncio.create_task(
-            update.message.chat.send_action(action="typing")
-        )
         
         # Handle image generation
         if user_states[user_id]["mode"] == "image":
@@ -680,12 +698,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"Trying model: {model}")
                 conversation = user_states[user_id]["conversation"]
                 
-                # Log current provider and its status
-                if hasattr(client, '_provider'):
-                    provider_name = type(client._provider).__name__
-                    provider_status = "active" if client._provider.working else "inactive"
-                    logger.info(f"Current provider: {provider_name} (status: {provider_status})")
-                
                 # Handle text message
                 if update.message.text:
                     gpt_response = conversation.get_response(update.message.text, model)
@@ -715,17 +727,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "Извините, я могу обрабатывать только текстовые сообщения и изображения.",
                         reply_markup=reply_markup
                     )
+                    typing_task.cancel()
                     return
                 
                 if gpt_response:
-                    provider_name = "Google" if conversation.use_google_api else "Default"
-                    logger.info(f"Successfully got response using provider: {provider_name}")
                     await update.message.reply_text(gpt_response, reply_markup=reply_markup)
                     
                     # Check if history was trimmed and send summary suggestion if needed
                     if len(conversation.history) > len(conversation.system_prompt) + conversation.max_messages and not conversation.summary_suggestion_sent:
                         await update.message.reply_text(
-                            "⚠️ История диалога достигла максимального размера. Рекомендую использовать команду /summary для суммирования истории и продолжения общения. Вы можете проигнорировать этот совет и продолжить общение, однако бот начнёт забывать последнее из 30 отправленных сообщений.",
+                            "⚠️ История диалога достигла максимального размера. Рекомендую использовать команду /summary для суммирования истории и продолжения общения. Вы можете проигнорировать этот совет и продолжить общение, однако в памяти бота будет сохраняться только последние 30 сообщений.",
                             reply_markup=reply_markup
                         )
                         conversation.summary_suggestion_sent = True
@@ -734,16 +745,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
                     
             except Exception as e:
-                # Log detailed error information
-                logger.error(f"Detailed error for model {model}:")
-                logger.error(f"Error type: {type(e).__name__}")
-                logger.error(f"Error message: {str(e)}")
-                if hasattr(e, '__traceback__'):
-                    import traceback
-                    logger.error(f"Traceback: {''.join(traceback.format_tb(e.__traceback__))}")
-                
-                provider_name = "Google" if conversation.use_google_api else "Default"
-                logger.warning(f"Provider {provider_name} failed for model {model}: {str(e)}")
+                logger.error(f"Error with model {model}: {e}")
                 continue
         
         # If we get here, all models failed
@@ -761,6 +763,101 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup
         )
     finally:
+        # Cancel typing action if it's still running
+        if 'typing_task' in locals():
+            typing_task.cancel()
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # Start typing action that will continue until we send a response
+        typing_task = asyncio.create_task(
+            update.message.chat.send_action(action="typing")
+        )
+        
+        user_id = update.effective_user.id
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        ogg_path = f"voice_{voice.file_id}.ogg"
+        await file.download_to_drive(ogg_path)
+
+        # Загрузка файла в Google Gemini
+        myfile = client.files.upload(file=ogg_path)
+        
+        # Получаем текущую беседу пользователя
+        conversation = user_states[user_id]["conversation"]
+        
+        # Добавляем сообщение о голосовом в историю
+        voice_message = "user отправил голосовое сообщение"
+        conversation.add_message("user", voice_message)
+        
+        # Формируем историю в виде текста
+        history_text = ""
+        for msg in conversation.history:
+            if msg["role"] == "system":
+                continue
+            role = "user" if msg["role"] == "user" else "assistant"
+            history_text += f"{role}: {msg['content']}\n"
+        
+        # Добавляем текущее сообщение с голосовым
+        current_message = "Вместо текста user отправил голосовое сообщение. Не упоминай голосовое сообщение, просто ответь на него. Если есть история сообщений, то учитывай контекст."
+        try:    
+            # Получаем ответ от Google AI
+            response = client.models.generate_content(
+                model=MODELS[0],
+                contents=[history_text + "\n" + current_message, myfile],
+                config=types.GenerateContentConfig(
+                    system_instruction=conversation.system_prompt[0]["content"],
+                    safety_settings=[
+                        types.SafetySetting(
+                            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                            threshold=types.HarmBlockThreshold.BLOCK_NONE
+                        ),
+                        types.SafetySetting(
+                            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                            threshold=types.HarmBlockThreshold.BLOCK_NONE
+                        ),
+                        types.SafetySetting(
+                            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                            threshold=types.HarmBlockThreshold.BLOCK_NONE
+                        ),
+                        types.SafetySetting(
+                            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                            threshold=types.HarmBlockThreshold.BLOCK_NONE
+                        )
+                    ]
+                )
+            )
+
+            if not response or not response.text:
+                raise Exception("Empty response from Gemini API")
+
+                # Добавляем ответ ассистента в историю
+            conversation.add_message("assistant", response.text)
+                
+                # Ответ пользователю
+            await update.message.reply_text(response.text, reply_markup=reply_markup)
+            
+
+        except Exception as e:
+                logger.error(f"Error in Gemini API call: {e}")
+                # Сбрасываем состояние беседы в случае ошибки
+                # user_states[user_id]["conversation"] = Conversation()
+                raise
+
+    except Exception as e:
+        logger.error(f"Error in handle_voice: {e}")
+        await update.message.reply_text(
+            "Извините, не удалось обработать голосовое сообщение. Попробуйте отправить сообщение снова.",
+            reply_markup=reply_markup
+        )
+    finally:
+        # Очистка временного файла
+        try:
+            if os.path.exists(ogg_path):
+                os.remove(ogg_path)
+        except Exception as e:
+            logger.error(f"Error removing temporary file: {e}")
+        
         # Cancel typing action if it's still running
         if 'typing_task' in locals():
             typing_task.cancel()
@@ -784,6 +881,7 @@ def main():
         application.add_handler(CommandHandler("models", models_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(MessageHandler(filters.PHOTO, handle_message))  # Add photo handler
+        application.add_handler(MessageHandler(filters.VOICE, handle_voice))  # Add voice handler
         
         # Add error handler
         application.add_error_handler(error_handler)
