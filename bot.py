@@ -24,6 +24,11 @@ from google.genai.types import Tool, GoogleSearch
 import time
 import threading
 import datetime
+import re
+import atexit
+import signal
+import sys
+import platform
 
 # Configure logging
 logging.basicConfig(
@@ -38,8 +43,75 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 # Load environment variables
 load_dotenv()
 
+# Global variables for shutdown handling
+shutdown_event = threading.Event()
+application = None
+lock_file = None
 
+def acquire_lock():
+    """Try to acquire a lock file to ensure only one instance is running."""
+    global lock_file
+    lock_file = open('bot.lock', 'w')
+    
+    if platform.system() == 'Windows':
+        try:
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            return lock_file
+        except IOError:
+            logger.error("Another instance of the bot is already running")
+            sys.exit(1)
+    else:
+        try:
+            import fcntl
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_file
+        except IOError:
+            logger.error("Another instance of the bot is already running")
+            sys.exit(1)
 
+def release_lock():
+    """Release the lock file."""
+    global lock_file
+    if lock_file:
+        if platform.system() == 'Windows':
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+        try:
+            os.remove('bot.lock')
+        except:
+            pass
+        lock_file = None
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals."""
+    logger.info(f"Received signal {signum}")
+    if application:
+        logger.info("Initiating graceful shutdown...")
+        shutdown_event.set()
+        asyncio.run(shutdown(application))
+    sys.exit(0)
+
+async def shutdown(application: Application):
+    """Shutdown the bot gracefully."""
+    logger.info("Shutting down bot...")
+    await application.stop()
+    await application.shutdown()
+
+def cleanup():
+    """Cleanup function to be called on exit."""
+    logger.info("Cleaning up...")
+    if application:
+        asyncio.run(shutdown(application))
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+atexit.register(cleanup)
 
 # Available models
 MODELS = [
@@ -104,6 +176,8 @@ providers = [
 client = genai.Client(api_key=os.getenv('GEMINI')
     #http_options="http://127.0.0.1:10809" PROXY TURN ON/OFF
 )
+
+# Configure Google Search with basic settings
 google_search_tool = Tool(
     google_search = GoogleSearch()
 )
@@ -150,11 +224,19 @@ sysprompt_template = [{
 
 Не слишком длинные блоки текста — читается легко.
 
-Не боишься шутить над собой или даже над пользователем, но без злобы."""
+Не боишься шутить над собой или даже над пользователем, но без злобы.
+
+🔍 Поисковая способность:
+Ты можешь использовать Google Search для получения актуальной информации. Если ты не уверена в каких-то фактах или нуждаешься в свежей информации — используй поиск. Но делай это естественно, как будто это часть твоего характера. Например:
+- "Хм, дай-ка я проверю последние новости..."
+- "Сейчас погуглю, чтобы не нести чушь..."
+- "О, интересный вопрос! Давай посмотрим, что там нового..."
+
+Когда используешь поиск, можешь добавить немного юмора или сарказма в процесс, но не забывай о точности информации."""
 }]
 
 sysprompt_formattingrules = """В зависимости от ситуации assistant может форматировать текст, используя HTML-тэги: <b>, <i>, <s>, <u>, <code>, <pre>, <a href='url'>. Не используй Markdown форматирование.
-НИКОГДА не используй формат ответа:"assistant:..." """
+НИКОГДА не пиши в начале своего ответа:"assistant:..." """
 
 sysprompt_chat = [{
     "role": "system",
@@ -194,12 +276,15 @@ def sanitize_input(user_input: str) -> str:
     return user_input
 
 class Conversation:
-    def __init__(self, user_id=None):
-        # Store user_id for file operations
+    def __init__(self, user_id=None, history_id="default", load_existing=True):
+        # Store user_id and history_id for file operations
         self.user_id = user_id
-        # Store system prompt separately
-        self.system_prompt = sysprompt_template[0]["content"]  # Default system prompt
-        logger.info(f"Initializing new conversation with system prompt: {self.system_prompt}")
+        self.history_id = history_id
+        # Store system prompt in the correct format
+        self.system_prompt = [{
+            "role": "system",
+            "content": sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules
+        }]
         # Initialize history without system prompt
         self.history = []
         # Maximum number of messages to keep
@@ -215,67 +300,167 @@ class Conversation:
         # Store the image file for visual novel mode
         self.visual_novel_image = None
         
-        # Load existing conversation if user_id is provided
-        if user_id:
-            self.load_from_file()
+        # Load existing conversation if user_id is provided and load_existing is True
+        if user_id and load_existing:
+            self._load_from_file()
 
-    def save_to_file(self):
-        """Save conversation state to file"""
-        if not self.user_id:
-            return
-            
-        try:
-            # Convert image to base64 if exists
-            visual_novel_image_b64 = None
-            if self.visual_novel_image:
-                visual_novel_image_b64 = base64.b64encode(self.visual_novel_image).decode('utf-8')
-            
-            data = {
-                'system_prompt': self.system_prompt,
-                'history': self.history,
-                'max_messages': self.max_messages,
-                'summary_suggestion_sent': self.summary_suggestion_sent,
-                'visual_novel_mode': self.visual_novel_mode,
-                'visual_novel_image': visual_novel_image_b64
-            }
-            
-            # Create conversations directory if it doesn't exist
-            os.makedirs('conversations', exist_ok=True)
-            
-            # Save to file
-            with open(f'conversations/{self.user_id}.json', 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                
-            logger.info(f"Saved conversation for user {self.user_id}")
-        except Exception as e:
-            logger.error(f"Error saving conversation for user {self.user_id}: {e}")
-
-    def load_from_file(self):
-        """Load conversation state from file"""
-        if not self.user_id:
-            return
-            
+    def _load_from_file(self):
+        """Load conversation state from a file."""
         try:
             file_path = f'conversations/{self.user_id}.json'
+            if not os.path.exists(file_path):
+                logger.info(f"No conversation file found for user {self.user_id}, using default settings")
+                return
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except json.JSONDecodeError:
+                logger.error(f"Error reading conversation file for user {self.user_id}")
+                return
+            
+            # Get current history ID from file or use default
+            current_history = data.get('current_history', 'default')
+            
+            # If no specific history_id was requested, use the current one
+            if self.history_id == "default" and current_history != "default":
+                self.history_id = current_history
+            
+            if self.history_id not in data:
+                logger.info(f"No history {self.history_id} found for user {self.user_id}, using default settings")
+                return
+            
+            conversation_data = data[self.history_id]
+            
+            # Load all attributes
+            system_prompt_content = conversation_data.get('system_prompt', self.system_prompt[0]["content"])
+            self.system_prompt = [{
+                "role": "system",
+                "content": system_prompt_content
+            }]
+            self.history = conversation_data.get('history', [])
+            self.max_messages = conversation_data.get('max_messages', 50)
+            self.visual_novel_mode = conversation_data.get('visual_novel_mode', False)
+            
+            # Convert base64 image back to bytes
+            visual_novel_image = conversation_data.get('visual_novel_image')
+            if visual_novel_image:
+                try:
+                    self.visual_novel_image = base64.b64decode(visual_novel_image)
+                except Exception as e:
+                    logger.error(f"Error decoding base64 image: {e}")
+                    self.visual_novel_image = None
+            else:
+                self.visual_novel_image = None
+                
+            self.last_image_message_id = conversation_data.get('last_image_message_id')
+            self.summary_suggestion_sent = conversation_data.get('summary_suggestion_sent', False)
+            
+            logger.info(f"Loaded conversation state for user {self.user_id}, history {self.history_id}")
+            logger.info(f"Loaded system prompt: {self.system_prompt[0]['content']}")
+            
+        except Exception as e:
+            logger.error(f"Error loading conversation state: {e}")
+
+    def save_to_file(self):
+        """Save conversation state to a file."""
+        try:
+            file_path = f'conversations/{self.user_id}.json'
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            
+            # Load existing data if file exists
+            data = {}
+            if os.path.exists(file_path):
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except json.JSONDecodeError:
+                    logger.error(f"Error reading existing conversation file for user {self.user_id}")
+                    data = {}
+            
+            # Convert image to base64 for saving
+            visual_novel_image = None
+            if self.visual_novel_image:
+                visual_novel_image = base64.b64encode(self.visual_novel_image).decode('utf-8')
+            
+            # Update data for current history
+            data[self.history_id] = {
+                'system_prompt': self.system_prompt[0]["content"],
+                'history': self.history,
+                'max_messages': self.max_messages,
+                'visual_novel_mode': self.visual_novel_mode,
+                'visual_novel_image': visual_novel_image,
+                'last_image_message_id': self.last_image_message_id,
+                'summary_suggestion_sent': self.summary_suggestion_sent
+            }
+            
+            # Update current history
+            data['current_history'] = self.history_id
+            
+            # Ensure default history exists
+            if 'default' not in data:
+                data['default'] = {
+                    'system_prompt': sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules,
+                    'history': [],
+                    'max_messages': 30,
+                    'visual_novel_mode': False,
+                    'visual_novel_image': None,
+                    'last_image_message_id': None,
+                    'summary_suggestion_sent': False
+                }
+            
+            # Save updated data
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"Saved conversation state for user {self.user_id}, history {self.history_id}")
+            
+        except Exception as e:
+            logger.error(f"Error saving conversation state: {e}")
+
+    @staticmethod
+    def get_available_histories(user_id):
+        """Get list of available chat histories for user"""
+        try:
+            file_path = f'conversations/{user_id}.json'
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # Filter out current_history from the list and ensure default is included
+                histories = [h for h in data.keys() if h != 'current_history']
+                if 'default' not in histories:
+                    histories.append('default')
+                return histories
+            return ["default"]
+        except Exception as e:
+            logger.error(f"Error getting histories for user {user_id}: {e}")
+            return ["default"]
+
+    @staticmethod
+    def delete_history(user_id, history_id):
+        """Delete specific chat history"""
+        try:
+            file_path = f'conversations/{user_id}.json'
             if os.path.exists(file_path):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
-                self.system_prompt = data.get('system_prompt', self.system_prompt)
-                self.history = data.get('history', [])
-                self.max_messages = data.get('max_messages', self.max_messages)
-                self.summary_suggestion_sent = data.get('summary_suggestion_sent', False)
-                self.visual_novel_mode = data.get('visual_novel_mode', False)
-                
-                # Load image from base64 if exists
-                visual_novel_image_b64 = data.get('visual_novel_image')
-                if visual_novel_image_b64:
-                    self.visual_novel_image = base64.b64decode(visual_novel_image_b64)
-                    self.visual_novel_mode = True  # Enable visual novel mode if image exists
-                
-                logger.info(f"Loaded conversation for user {self.user_id}")
+                if history_id in data:
+                    # Don't allow deleting the default history
+                    if history_id == "default":
+                        return False
+                    
+                    del data[history_id]
+                    
+                    # Save updated histories
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    
+                    return True
+            return False
         except Exception as e:
-            logger.error(f"Error loading conversation for user {self.user_id}: {e}")
+            logger.error(f"Error deleting history {history_id} for user {user_id}: {e}")
+            return False
 
     def add_message(self, role, content):
         # Add new message
@@ -318,24 +503,36 @@ class Conversation:
         return assistant_response
 
     def get_response_google(self, user_message, model):
-        """New method using Google's genai"""
+        """New method using Google's genai with search capability."""
         # Add user message to history
         self.add_message("user", user_message)
         
-        # Convert history to Google's format
+        # Filter out messages with None content and convert history to Google's format
         history_text = ""
         for msg in self.history:
+            if msg["content"] is None:  # Skip messages with None content
+                continue
             role = "user" if msg["role"] == "user" else "assistant"
             history_text += f"{role}: {msg['content']}\n"
         
-        logger.info(f"Using system prompt: {self.system_prompt}")
+        logger.info(f"Using system prompt: {self.system_prompt[0]['content']}")
         
-        # Get response from Google's AI
+        # Configure tools based on history type
+        tools = []
+        if self.history_id == "default":
+            tools = [types.Tool(
+                google_search=types.GoogleSearchRetrieval(
+                    dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                        dynamic_threshold=0.96))
+            )]
+        
+        # Get response from Google's AI with search capability
         response = client.models.generate_content(
             model=model,
             contents=history_text,
             config=types.GenerateContentConfig(
-                system_instruction=self.system_prompt,  # Use instance's system prompt
+                system_instruction=self.system_prompt[0]["content"],  # Use instance's system prompt
+                tools=tools,
                 safety_settings=[
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -357,9 +554,37 @@ class Conversation:
             )
         )
         
+        # Validate response
+        if not response or not hasattr(response, 'text') or not response.text:
+            logger.error("Empty or invalid response from Gemini API")
+            raise Exception("Empty response from Gemini API")
+        
         # Add AI response to history
         assistant_response = response.text
+        
+        # Add response to history
         self.add_message("assistant", assistant_response)
+        
+        # If there are search results, add them to the response
+        if hasattr(response, 'candidates') and response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'grounding_metadata'):
+                # Add search suggestions if available
+                if (hasattr(candidate.grounding_metadata, 'search_entry_point') and 
+                    candidate.grounding_metadata.search_entry_point is not None and
+                    hasattr(candidate.grounding_metadata.search_entry_point, 'rendered_content')):
+                    
+                    search_suggestions = candidate.grounding_metadata.search_entry_point.rendered_content
+                    if search_suggestions:
+                        # Extract only the actual search suggestions, ignoring HTML/CSS
+                        import re
+                        # Find all text that looks like search queries (not CSS or HTML)
+                        search_queries = re.findall(r'(?<!\w)(?!.*\{)(?!.*\})(?!.*@media)(?!.*\.)(?!.*\*)(?!.*\:)(?!.*\;)(?!.*\()(?!.*\))(?!.*\[)(?!.*\])(?!.*\<)(?!.*\>)(?!.*\/)(?!.*\\).+?(?=\s*$|\s*\n)', search_suggestions, re.MULTILINE)
+                        if search_queries:
+                            # Filter out empty strings and join with bullet points
+                            search_queries = [q.strip() for q in search_queries if q.strip()]
+                            if search_queries:
+                                assistant_response += "\n\n🔍 Похожие запросы для поиска:\n• " + "\n• ".join(search_queries)
         
         return assistant_response
     
@@ -393,7 +618,7 @@ class Conversation:
             model=model,
             contents=[history_text + "\n" + current_message, image],
             config=types.GenerateContentConfig(
-                system_instruction=self.system_prompt,  # Use instance's system prompt
+                system_instruction=self.system_prompt[0]["content"],  # Use instance's system prompt
                 safety_settings=[
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -526,11 +751,28 @@ async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Reset conversation and clear image
-        user_states[user_id]["conversation"] = Conversation(user_id)
+        # Get current history ID
+        current_history_id = user_states[user_id]["conversation"].history_id
+        
+        # Create new conversation instance with the same history ID
+        new_conversation = Conversation(user_id, current_history_id)
+        # Keep the current system prompt
+        new_conversation.system_prompt = user_states[user_id]["conversation"].system_prompt
+        # Reset all other settings
+        new_conversation.history = []
+        new_conversation.visual_novel_mode = False
+        new_conversation.visual_novel_image = None
+        new_conversation.last_image_message_id = None
+        new_conversation.summary_suggestion_sent = False
+        
+        # Update user state with new conversation
+        user_states[user_id]["conversation"] = new_conversation
+        
+        # Save the new state
+        new_conversation.save_to_file()
         
         await update.message.reply_text(
-            "История диалога очищена. Вы можете начать новый диалог.",
+            f"✅ История диалога '{current_history_id}' успешно очищена. Вы можете начать новый диалог.",
             reply_markup=main_reply_markup,
             parse_mode="HTML"
         )
@@ -559,6 +801,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 /reset - Сбросить все настройки и историю к значениям по умолчанию
 
+/history - Управление историями чатов
+
 /start - Начать общение
 
 /help - Показать это сообщение
@@ -577,7 +821,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Summarize the conversation history."""
+    """Summarize conversation history."""
     try:
         user_id = update.effective_user.id
         
@@ -592,8 +836,11 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         conversation = user_states[user_id]["conversation"]
         
-        # Get history without last bot message
-        history_to_summarize = conversation.history[:-1]
+        # Get history without last bot message and filter out None content
+        history_to_summarize = []
+        for msg in conversation.history:
+            if msg["content"] is not None:  # Skip messages with None content
+                history_to_summarize.append(msg)
         
         if len(history_to_summarize) < 2:
             await update.message.reply_text(
@@ -604,21 +851,16 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Create summary prompt
-        summary_prompt = "Пожалуйста, кратко суммируй следующую историю диалога, сохраняя ключевые моменты и контекст:\n\n"
+        summary_prompt = "Пожалуйста, суммируй следующий диалог, сохраняя ключевые моменты и контекст:\n\n"
         for msg in history_to_summarize:
-            role = "Пользователь" if msg["role"] == "user" else "Ассистент"
+            role = "user" if msg["role"] == "user" else "assistant"
             summary_prompt += f"{role}: {msg['content']}\n"
         
-        # Convert summary prompt to Google's format
-        google_messages = [{
-            "role": "user",
-            "parts": [{"text": summary_prompt}]
-        }]
-        
+        logger.info(f"Summary prompt: {summary_prompt}")
         # Get summary from Google's AI
         summary_response = client.models.generate_content(
             model=MODELS[0],
-            contents=google_messages,
+            contents=summary_prompt,
             config=types.GenerateContentConfig(
                 system_instruction="Ты - ассистент, который умеет кратко и точно суммировать диалоги, сохраняя ключевые моменты и контекст.",
                 safety_settings=[
@@ -641,13 +883,24 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
             )
         )
+        
+        if not summary_response or not summary_response.text:
+            raise Exception("Empty response from Gemini API")
+            
         summary = summary_response.text
         
+        # Get the last valid bot message
+        last_bot_message = None
+        for msg in reversed(conversation.history):
+            if msg["role"] == "assistant" and msg["content"] is not None:
+                last_bot_message = msg["content"]
+                break
+        
         # Update conversation history
-        last_bot_message = conversation.history[-1]  # Save last bot message
         conversation.history = []  # Reset history
         conversation.add_message("assistant", summary)  # Add summary
-        conversation.add_message("assistant", last_bot_message["content"])  # Add last bot message
+        if last_bot_message:
+            conversation.add_message("assistant", last_bot_message)  # Add last bot message
         
         # Reset summary suggestion flag
         conversation.summary_suggestion_sent = False
@@ -845,10 +1098,12 @@ async def img_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Process the conversation history to create a prompt
             history_text = ""
             for msg in conversation.history:
+                if msg["content"] is None:  # Skip messages with None content
+                    continue
                 role = "user" if msg["role"] == "user" else "assistant"
                 history_text += f"{role}: {msg['content']}\n"
             
-            final_prompt = "Воспользуйся всей информацией после этого сообщения для создания промпта:/n"+ conversation.system_prompt + history_text
+            final_prompt = "Воспользуйся всей информацией после этого сообщения для создания промпта:/n"+ conversation.system_prompt[0]["content"] + history_text
             
             # Add timeout for prompt processing
             try:
@@ -856,6 +1111,7 @@ async def img_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     process_prompt(final_prompt, "anime"),
                     timeout=30  # 30 seconds timeout
                 )
+                logger.info(f"Processed prompt: {processed_prompt}")
             except asyncio.TimeoutError:
                 logger.error("Timeout while processing prompt")
                 await update.message.reply_text(
@@ -898,21 +1154,38 @@ async def img_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Send the image with the last bot message as caption
             last_bot_message = None
             for msg in reversed(conversation.history):
-                if msg["role"] == "assistant":
+                if msg["role"] == "assistant" and msg["content"] is not None:
                     last_bot_message = msg["content"]
                     break
             
             try:
                 if last_bot_message:
-                    sent_message = await update.message.reply_photo(
-                        conversation.visual_novel_image,
-                        caption=last_bot_message,
-                        reply_markup=main_reply_markup,
-                        parse_mode="HTML"
-                    )
+                    try:
+                        sent_message = await update.message.reply_photo(
+                            conversation.visual_novel_image,  
+                            caption=last_bot_message,
+                            reply_markup=main_reply_markup,
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        if "caption is too long" in str(e).lower():
+                            # Send image without caption
+                            sent_message = await update.message.reply_photo(
+                                conversation.visual_novel_image,
+                                reply_markup=main_reply_markup,
+                                parse_mode="HTML"
+                            )
+                            # Send text as separate message
+                            await update.message.reply_text(
+                                last_bot_message,
+                                reply_markup=main_reply_markup,
+                                parse_mode="HTML"
+                            )
+                        else:
+                            raise e
                 else:
                     sent_message = await update.message.reply_photo(
-                        conversation.visual_novel_image,
+                        conversation.visual_novel_image,  
                         reply_markup=main_reply_markup,
                         parse_mode="HTML"
                     )
@@ -965,24 +1238,211 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         user_id = update.effective_user.id
         
+        # Handle history selection
+        if user_id in user_states and user_states[user_id].get("waiting_for_history", False):
+            if update.message.text == "➕ Создать новую историю":
+                # Set state to wait for new history name
+                user_states[user_id]["waiting_for_history_name"] = True
+                await update.message.reply_text(
+                    "Введите название для новой истории:",
+                    reply_markup=ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True),
+                    parse_mode="HTML"
+                )
+                typing_task.cancel()
+                return
+            elif update.message.text == "❌ Удалить историю":
+                # Set state to wait for history deletion
+                user_states[user_id]["waiting_for_history_delete"] = True
+                histories = Conversation.get_available_histories(user_id)
+                keyboard = [[KeyboardButton(f"🗑 {history_id}")] for history_id in histories]
+                keyboard.append([KeyboardButton("Отмена")])
+                await update.message.reply_text(
+                    "Выберите историю для удаления:",
+                    reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+                    parse_mode="HTML"
+                )
+                typing_task.cancel()
+                return
+            elif update.message.text == "Назад":
+                user_states[user_id]["waiting_for_history"] = False
+                await update.message.reply_text(
+                    "Выберите действие:",
+                    reply_markup=main_reply_markup,
+                    parse_mode="HTML"
+                )
+                typing_task.cancel()
+                return
+            elif update.message.text.startswith("📝 "):
+                # Switch to selected history
+                history_id = update.message.text[2:].strip()
+                if history_id.startswith("✓ "):
+                    history_id = history_id[2:].strip()
+                
+                logger.info(f"Attempting to switch to history: {history_id}")
+                
+                # Create new conversation with selected history
+                new_conversation = Conversation(user_id, history_id)
+                logger.info(f"Created new conversation instance for history: {history_id}")
+                
+                # If switching to default history, ensure it exists and is properly initialized
+                if history_id == "default":
+                    file_path = f'conversations/{user_id}.json'
+                    logger.info(f"Switching to default history, checking file: {file_path}")
+                    if os.path.exists(file_path):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            logger.info(f"Current file contents - current_history: {data.get('current_history')}, available histories: {list(data.keys())}")
+                            
+                            if 'default' not in data:
+                                logger.info("Default history not found, creating it")
+                                data['default'] = {
+                                    'system_prompt': sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules,
+                                    'history': [],
+                                    'max_messages': 30,
+                                    'visual_novel_mode': False,
+                                    'visual_novel_image': None,
+                                    'last_image_message_id': None,
+                                    'summary_suggestion_sent': False
+                                }
+                            # Explicitly set current_history to default
+                            data['current_history'] = 'default'
+                            logger.info("Setting current_history to default")
+                            with open(file_path, 'w', encoding='utf-8') as f:
+                                json.dump(data, f, ensure_ascii=False, indent=2)
+                            logger.info("Saved updated file with default history")
+                        except Exception as e:
+                            logger.error(f"Error ensuring default history exists: {e}")
+                
+                # Update user state with new conversation
+                user_states[user_id]["conversation"] = new_conversation
+                user_states[user_id]["waiting_for_history"] = False
+                logger.info(f"Updated user state with new conversation for history: {history_id}")
+                
+                # Save the new state and ensure it's loaded
+                new_conversation.save_to_file()
+                logger.info("Saved new conversation state to file")
+                
+                # Explicitly update current_history in the file
+                file_path = f'conversations/{user_id}.json'
+                if os.path.exists(file_path):
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        logger.info(f"Before updating current_history - current value: {data.get('current_history')}")
+                        data['current_history'] = history_id
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        logger.info(f"Updated current_history to: {history_id}")
+                    except Exception as e:
+                        logger.error(f"Error updating current_history: {e}")
+                
+                # Reload the state and ensure history_id is updated
+                new_conversation._load_from_file()
+                new_conversation.history_id = history_id  # Explicitly set history_id
+                logger.info(f"Reloaded conversation state and set history_id to: {history_id}")
+                
+                # Verify the final state
+                file_path = f'conversations/{user_id}.json'
+                if os.path.exists(file_path):
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        logger.info(f"Final state - current_history: {data.get('current_history')}, conversation history_id: {new_conversation.history_id}")
+                    except Exception as e:
+                        logger.error(f"Error verifying final state: {e}")
+                
+                await update.message.reply_text(
+                    f"✅ Переключено на историю: {history_id}",
+                    reply_markup=main_reply_markup,
+                    parse_mode="HTML"
+                )
+                typing_task.cancel()
+                return
+            elif update.message.text.startswith("🗑 "):
+                # Delete selected history
+                history_id = update.message.text[2:]
+                if Conversation.delete_history(user_id, history_id):
+                    await update.message.reply_text(
+                        f"✅ История {history_id} успешно удалена",
+                        reply_markup=main_reply_markup,
+                        parse_mode="HTML"
+                    )
+                else:
+                    await update.message.reply_text(
+                        "❌ Не удалось удалить историю",
+                        reply_markup=main_reply_markup,
+                        parse_mode="HTML"
+                    )
+                user_states[user_id]["waiting_for_history"] = False
+                typing_task.cancel()
+                return
+            elif update.message.text == "Отмена":
+                user_states[user_id]["waiting_for_history"] = False
+                await update.message.reply_text(
+                    "Выберите действие:",
+                    reply_markup=main_reply_markup,
+                    parse_mode="HTML"
+                )
+                typing_task.cancel()
+                return
+        
+        # Handle new history name input
+        if user_id in user_states and user_states[user_id].get("waiting_for_history_name", False):
+            if update.message.text == "Отмена":
+                user_states[user_id]["waiting_for_history_name"] = False
+                await update.message.reply_text(
+                    "Выберите действие:",
+                    reply_markup=main_reply_markup,
+                    parse_mode="HTML"
+                )
+                typing_task.cancel()
+                return
+            
+            # Create new history
+            history_id = update.message.text.strip()
+            user_states[user_id]["conversation"] = Conversation(user_id, history_id)
+            user_states[user_id]["waiting_for_history_name"] = False
+            await update.message.reply_text(
+                f"✅ Создана новая история: {history_id}",
+                reply_markup=main_reply_markup,
+                parse_mode="HTML"
+            )
+            typing_task.cancel()
+            return
+
         # Check if user is waiting for new system prompt
         if user_id in user_states and user_states[user_id].get("waiting_for_prompt", False):
             # Create new system prompt
             new_system_prompt = update.message.text
-            logger.info(f"Updating system prompt for user {user_id}")
+            current_history_id = user_states[user_id].get("current_history_id", "default")
+            logger.info(f"Updating system prompt for user {user_id}, history {current_history_id}")
             
             # Create new conversation with updated system prompt
-            conversation = Conversation(user_id)
-            conversation.system_prompt = new_system_prompt + "\n\n" + sysprompt_formattingrules
+            conversation = Conversation(user_id, current_history_id)
+            conversation.system_prompt = [{
+                "role": "system",
+                "content": new_system_prompt + "\n\n" + sysprompt_formattingrules
+            }]
+            # Clear history for the new prompt
+            conversation.history = []
+            conversation.visual_novel_mode = False
+            conversation.visual_novel_image = None
+            conversation.last_image_message_id = None
+            conversation.summary_suggestion_sent = False
+            
+            # Update user state
             user_states[user_id]["conversation"] = conversation
             
-            logger.info(f"New prompt set: {conversation.system_prompt}")
+            logger.info(f"New prompt set for history {current_history_id}: {conversation.system_prompt[0]['content']}")
             
             # Reset waiting state
             user_states[user_id]["waiting_for_prompt"] = False
+            if "current_history_id" in user_states[user_id]:
+                del user_states[user_id]["current_history_id"]
             
             await update.message.reply_text(
-                "Системный промпт успешно обновлен! Вы можете начать новый диалог.",
+                f"✅ Системный промпт для истории '{current_history_id}' успешно обновлен! Вы можете начать новый диалог.",
                 reply_markup=main_reply_markup,
                 parse_mode="HTML"
             )
@@ -1162,26 +1622,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             message_sent = True  # Mark message as sent
                         except Exception as e:
                             logger.error(f"Error in visual novel mode: {e}")
-                            # If sending fails, try to recover
-                            try:
-                                # Try to resend the image
-                                sent_message = await update.message.reply_photo(
-                                    conversation.visual_novel_image,
-                                    caption=gpt_response,
-                                    reply_markup=main_reply_markup,
-                                    parse_mode="HTML"
-                                )
-                                conversation.last_image_message_id = sent_message.message_id
-                                message_sent = True  # Mark message as sent
-                            except Exception as retry_e:
-                                logger.error(f"Error in visual novel mode retry: {retry_e}")
-                                # If retry fails, fall back to text
-                                await update.message.reply_text(
-                                    gpt_response,
-                                    reply_markup=main_reply_markup,
-                                    parse_mode="HTML"
-                                )
-                                message_sent = True  # Mark message as sent
+                            # If sending fails due to caption length, send image and text separately
+                            if "caption is too long" in str(e).lower():
+                                try:
+                                    # Send image without caption
+                                    sent_message = await update.message.reply_photo(
+                                        conversation.visual_novel_image,
+                                        reply_markup=main_reply_markup,
+                                        parse_mode="HTML"
+                                    )
+                                    conversation.last_image_message_id = sent_message.message_id
+                                    
+                                    # Send text as separate message
+                                    await update.message.reply_text(
+                                        gpt_response,
+                                        reply_markup=main_reply_markup,
+                                        parse_mode="HTML"
+                                    )
+                                    message_sent = True
+                                except Exception as retry_e:
+                                    logger.error(f"Error sending image and text separately: {retry_e}")
+                                    # If even that fails, fall back to text only
+                                    await update.message.reply_text(
+                                        gpt_response,
+                                        reply_markup=main_reply_markup,
+                                        parse_mode="HTML"
+                                    )
+                                    message_sent = True
+                            else:
+                                # For other errors, try to resend the image
+                                try:
+                                    sent_message = await update.message.reply_photo(
+                                        conversation.visual_novel_image,
+                                        caption=gpt_response,
+                                        reply_markup=main_reply_markup,
+                                        parse_mode="HTML"
+                                    )
+                                    conversation.last_image_message_id = sent_message.message_id
+                                    message_sent = True
+                                except Exception as retry_e:
+                                    logger.error(f"Error in visual novel mode retry: {retry_e}")
+                                    # If retry fails, fall back to text
+                                    await update.message.reply_text(
+                                        gpt_response,
+                                        reply_markup=main_reply_markup,
+                                        parse_mode="HTML"
+                                    )
+                                    message_sent = True
                     else:
                         await update.message.reply_text(
                             gpt_response,
@@ -1323,15 +1810,27 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Add current message
         current_message = "Вместо текста user отправил голосовое сообщение. Не упоминай голосовое сообщение, просто ответь на него. Если есть история сообщений, то учитывай контекст."
         
+        
+
         # Get response from Google AI with timeout
         try:
+            # Configure tools based on history type
+            tools = []
+            if conversation.history_id == "default":
+                tools = [types.Tool(
+                    google_search=types.GoogleSearchRetrieval(
+                        dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                            dynamic_threshold=0.96))
+                )]
+            
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.models.generate_content,
                     model=MODELS[0],
                     contents=[history_text + "\n" + current_message, myfile],
                     config=types.GenerateContentConfig(
-                        system_instruction=conversation.system_prompt,
+                        system_instruction=conversation.system_prompt[0]["content"],
+                        tools=tools,
                         safety_settings=[
                             types.SafetySetting(
                                 category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -1419,12 +1918,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if typing_task and not typing_task.done():
             typing_task.cancel()
 
-async def shutdown(application: Application):
-    """Shutdown the bot gracefully."""
-    logger.info("Shutting down bot...")
-    await application.stop()
-    await application.shutdown()
-
 class BotHealth:
     def __init__(self):
         self.last_activity = datetime.datetime.now()
@@ -1439,7 +1932,7 @@ class BotHealth:
     def check_health(self):
         with self.lock:
             time_since_last_activity = (datetime.datetime.now() - self.last_activity).total_seconds()
-            if time_since_last_activity > 300:  # 5 minutes without activity
+            if time_since_last_activity > 1000:  # 5 minutes without activity
                 self.is_healthy = False
                 logger.error(f"Bot appears to be hanging. No activity for {time_since_last_activity} seconds")
             return self.is_healthy
@@ -1466,10 +1959,23 @@ async def scenario_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.effective_user.id
         
+        # Check if user has an active conversation
+        if user_id not in user_states or "conversation" not in user_states[user_id]:
+            await update.message.reply_text(
+                "У вас нет активного диалога. Начните общение, нажав на кнопку 'Общаться'",
+                reply_markup=main_reply_markup,
+                parse_mode="HTML"
+            )
+            return
+        
+        # Get current history ID
+        current_history_id = user_states[user_id]["conversation"].history_id
+        
         # Set waiting state for new prompt
         if user_id not in user_states:
             user_states[user_id] = {}
         user_states[user_id]["waiting_for_prompt"] = True
+        user_states[user_id]["current_history_id"] = current_history_id  # Store current history ID
         
         examples = """
 Примеры системных промптов:
@@ -1493,7 +1999,7 @@ async def scenario_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         
         await update.message.reply_text(
-            "Пожалуйста, отправьте новый системный промпт для бота. Это определит его поведение и стиль общения.\n\n" + examples,
+            f"Пожалуйста, отправьте новый системный промпт для истории '{current_history_id}'. Это определит поведение и стиль общения бота.\n\n" + examples,
             reply_markup=main_reply_markup,
             parse_mode="HTML"
         )
@@ -1507,67 +2013,55 @@ async def scenario_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset conversation to default state, including system prompt."""
+    """Reset current conversation to default state."""
     try:
         user_id = update.effective_user.id
         
-        # First, delete the conversation file if it exists
-        file_path = f'conversations/{user_id}.json'
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                logger.info(f"Successfully deleted conversation file for user {user_id}")
-            except Exception as e:
-                logger.error(f"Error deleting conversation file: {e}")
-                await update.message.reply_text(
-                    "Произошла ошибка при удалении файла диалога. Попробуйте еще раз.",
-                    reply_markup=main_reply_markup,
-                    parse_mode="HTML"
-                )
-                return
-        
-        # Create new conversation with default settings
-        try:
-            new_conversation = Conversation(user_id)
-            # Force reset system prompt to default
-            
-            new_conversation.system_prompt = sysprompt_template[0]["content"]  + "\n\n" + sysprompt_formattingrules
-            # Clear any existing state
-            new_conversation.history = []
-            new_conversation.visual_novel_mode = False
-            new_conversation.visual_novel_image = None
-            new_conversation.last_image_message_id = None
-            new_conversation.summary_suggestion_sent = False
-            
-            # Update user state
-            user_states[user_id] = {
-                "mode": "chat",
-                "conversation": new_conversation
-            }
-            
-            # Save the new default state
-            new_conversation.save_to_file()
-            
-            logger.info(f"Successfully reset conversation for user {user_id}")
-            
+        # Check if user has an active conversation
+        if user_id not in user_states or "conversation" not in user_states[user_id]:
             await update.message.reply_text(
-                "✅ Все настройки успешно сброшены к значениям по умолчанию:\n"
-                "- История диалога очищена\n"
-                "- Системный промпт восстановлен\n"
-                "- Все дополнительные настройки сброшены",
-                reply_markup=main_reply_markup,
-                parse_mode="HTML"
-            )
-            
-        except Exception as e:
-            logger.error(f"Error creating new conversation: {e}")
-            await update.message.reply_text(
-                "Произошла ошибка при сбросе настроек. Попробуйте еще раз.",
+                "У вас нет активного диалога для сброса.",
                 reply_markup=main_reply_markup,
                 parse_mode="HTML"
             )
             return
-            
+        
+        # Get current history ID
+        current_history_id = user_states[user_id]["conversation"].history_id
+        
+        # Create new conversation instance with the same history ID
+        new_conversation = Conversation(user_id, current_history_id)
+        
+        # Reset system prompt to default format
+        new_conversation.system_prompt = [{
+            "role": "system",
+            "content": sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules
+        }]
+        
+        # Clear any existing state
+        new_conversation.history = []
+        new_conversation.visual_novel_mode = False
+        new_conversation.visual_novel_image = None
+        new_conversation.last_image_message_id = None
+        new_conversation.summary_suggestion_sent = False
+        
+        # Update user state
+        user_states[user_id]["conversation"] = new_conversation
+        
+        # Save the new state
+        new_conversation.save_to_file()
+        
+        logger.info(f"Successfully reset conversation for user {user_id}, history {current_history_id}")
+        
+        await update.message.reply_text(
+            f"✅ История '{current_history_id}' успешно сброшена к значениям по умолчанию:\n"
+            "- История диалога очищена\n"
+            "- Системный промпт восстановлен\n"
+            "- Все дополнительные настройки сброшены",
+            reply_markup=main_reply_markup,
+            parse_mode="HTML"
+        )
+        
     except Exception as e:
         logger.error(f"Error in reset command: {e}")
         await update.message.reply_text(
@@ -1576,9 +2070,73 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /history command to manage chat histories."""
+    try:
+        user_id = update.effective_user.id
+        
+        # Get available histories
+        histories = Conversation.get_available_histories(user_id)
+        
+        # Create keyboard with history options
+        keyboard = []
+        for history_id in histories:
+            # Add indicator for current history
+            current_marker = "✓ " if user_id in user_states and user_states[user_id].get("conversation", {}).history_id == history_id else ""
+            keyboard.append([KeyboardButton(f"{current_marker}📝 {history_id}")])
+        keyboard.append([KeyboardButton("➕ Создать новую историю")])
+        keyboard.append([KeyboardButton("❌ Удалить историю")])
+        keyboard.append([KeyboardButton("Назад")])
+        
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        # Show available histories
+        history_text = "📚 Доступные истории чатов:\n\n"
+        
+        # Load the conversation file once
+        file_path = f'conversations/{user_id}.json'
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            for history_id in histories:
+                # Get message count from the loaded data
+                message_count = len(data.get(history_id, {}).get('history', []))
+                current_marker = "✓ " if user_id in user_states and user_states[user_id].get("conversation", {}).history_id == history_id else ""
+                history_text += f"• {current_marker}{history_id} ({message_count} сообщений)\n"
+        else:
+            # If file doesn't exist, show default history with 0 messages
+            history_text += "• default (0 сообщений)\n"
+        
+        history_text += "\nВыберите историю для просмотра или создайте новую."
+        
+        await update.message.reply_text(
+            history_text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+        
+        # Set state to wait for history selection
+        if user_id not in user_states:
+            user_states[user_id] = {}
+        user_states[user_id]["waiting_for_history"] = True
+        
+    except Exception as e:
+        logger.error(f"Error in history command: {e}")
+        await update.message.reply_text(
+            "Извините, произошла ошибка при управлении историями. Пожалуйста, попробуйте позже.",
+            reply_markup=main_reply_markup,
+            parse_mode="HTML"
+        )
+
 def main():
     """Start the bot."""
+    global application
+    
     try:
+        # Try to acquire lock
+        lock_file = acquire_lock()
+        
         # Start health check thread
         health_thread = threading.Thread(target=health_check_loop, daemon=True)
         health_thread.start()
@@ -1593,9 +2151,10 @@ def main():
                 if filename.endswith('.json'):
                     try:
                         user_id = int(filename[:-5])  # Remove .json extension
+                        # Load conversation with current history
                         user_states[user_id] = {
                             "mode": "chat",
-                            "conversation": Conversation(user_id)
+                            "conversation": Conversation(user_id)  # Will load current history automatically
                         }
                         logger.info(f"Loaded conversation for user {user_id}")
                     except Exception as e:
@@ -1608,7 +2167,8 @@ def main():
         application.add_handler(CommandHandler("clean", clean_command))
         application.add_handler(CommandHandler("img", img_command))
         application.add_handler(CommandHandler("scenario", scenario_command))
-        application.add_handler(CommandHandler("reset", reset_command))  # Add reset command handler
+        application.add_handler(CommandHandler("reset", reset_command))
+        application.add_handler(CommandHandler("history", history_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(MessageHandler(filters.PHOTO, handle_message))
         application.add_handler(MessageHandler(filters.VOICE, handle_voice))
@@ -1619,7 +2179,7 @@ def main():
         # Start the Bot
         logger.info("Starting bot...")
         
-        # Run the bot until Ctrl+C is pressed
+        # Run the bot until shutdown event is set
         try:
             application.run_polling(
                 allowed_updates=Update.ALL_TYPES,
@@ -1628,38 +2188,15 @@ def main():
             )
         except Exception as e:
             logger.error(f"Error in polling: {e}")
-            # Try to recover
-            try:
-                # Wait a bit before retrying
-                time.sleep(5)
-                # Reset the application
-                application = Application.builder().token(os.getenv('TELEGRAM_BOT_TOKEN')).build()
-                # Re-add handlers
-                application.add_handler(CommandHandler("start", start))
-                application.add_handler(CommandHandler("help", help_command))
-                application.add_handler(CommandHandler("summary", summary_command))
-                application.add_handler(CommandHandler("clean", clean_command))
-                application.add_handler(CommandHandler("img", img_command))
-                application.add_handler(CommandHandler("scenario", scenario_command))
-                application.add_handler(CommandHandler("reset", reset_command))  # Re-add reset command handler
-                application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-                application.add_handler(MessageHandler(filters.PHOTO, handle_message))
-                application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-                application.add_error_handler(error_handler)
-                logger.info("Bot recovered and restarted")
-                # Run polling again
-                application.run_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                    close_loop=False
-                )
-            except Exception as recovery_e:
-                logger.error(f"Error in recovery: {recovery_e}")
-                raise  # Re-raise the exception to trigger proper shutdown
-        
+            raise
+        finally:
+            release_lock()
+            
     except Exception as e:
         logger.error(f"Error starting bot: {e}")
         logger.error("Please make sure your TELEGRAM_BOT_TOKEN is set in .env file")
+        if 'lock_file' in locals():
+            release_lock()
         raise
 
 if __name__ == '__main__':
@@ -1667,11 +2204,7 @@ if __name__ == '__main__':
         main()
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
-        # Properly exit the program
-        import sys
         sys.exit(0)
     except Exception as e:
         logger.error(f"Fatal error: {e}")
-        # Exit with error code
-        import sys
         sys.exit(1) 
