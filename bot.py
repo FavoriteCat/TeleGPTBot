@@ -922,39 +922,65 @@ async def generate_image_huggingface(prompt: str) -> str:
     """Generate image using Gradio client"""
     try:
         logger.info("Initializing Gradio client...")
-        client = GradioClient(
-            "Asahina2k/animagine-xl-4.0",
-            hf_token=os.getenv('HUGGINGFACE_API_KEY')
-        )
+        # client = GradioClient(
+        #     "Asahina2k/animagine-xl-4.0",
+        #     hf_token=os.getenv('HUGGINGFACE_API_KEY')
+        # )
         
         # Initialize API
-        logger.info("Initializing API...")
-        client.predict(api_name="/lambda")
+        # logger.info("Initializing API...")
+        # client.predict(api_name="/lambda")
         
         # Generate image
-        fixed_prompt = prompt + ",masterpiece, high score, great score, absurdre"
-        result = client.predict(
-            prompt=fixed_prompt,
-            negative_prompt="lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",
-            seed=0,
-            custom_width=1024,
-            custom_height=1024,
-            guidance_scale=5,
-            num_inference_steps=28,
-            sampler="Euler a",
-            aspect_ratio_selector="832 x 1216",
-            style_selector="(None)",
-            use_upscaler=False,
-            upscaler_strength=0.55,
-            upscale_by=1.5,
-            add_quality_tags=True,
-            api_name="/generate"
+        # fixed_prompt = prompt + ",masterpiece, high score, great score, absurdre"
+        # result = client.predict(
+        #     prompt=fixed_prompt,
+        #     negative_prompt="lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",
+        #     seed=0,
+        #     custom_width=1024,
+        #     custom_height=1024,
+        #     guidance_scale=5,
+        #     num_inference_steps=28,
+        #     sampler="Euler a",
+        #     aspect_ratio_selector="832 x 1216",
+        #     style_selector="(None)",
+        #     use_upscaler=False,
+        #     upscaler_strength=0.55,
+        #     upscale_by=1.5,
+        #     add_quality_tags=True,
+        #     api_name="/generate"
+        # )
+        
+        # # Finalize
+        # logger.info("Finalizing generation...")
+        # client.predict(api_name="/lambda_1")
+        
+        client = GradioClient(
+            "Asahina2K/animagine-xl-3.1",
+            hf_token=os.getenv('HUGGINGFACE_API_KEY')
         )
-        
-        # Finalize
-        logger.info("Finalizing generation...")
-        client.predict(api_name="/lambda_1")
-        
+        logger.info("Initializing API...")
+        fixed_prompt = prompt + ",masterpiece, high score, great score, absurdre"
+        result = await asyncio.to_thread(
+            client.predict,
+            fixed_prompt,  # str in 'Prompt' Textbox component
+            "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",  # str in 'Negative Prompt' Textbox component
+            0,  # float (numeric value between 0 and 2147483647) in 'Seed' Slider component
+            896,  # float (numeric value between 512 and 2048) in 'Width' Slider component
+            1152,  # float (numeric value between 512 and 2048) in 'Height' Slider component
+            7,  # float (numeric value between 1 and 12) in 'Guidance scale' Slider component
+            28,  # float (numeric value between 1 and 50) in 'Number of inference steps' Slider component
+            "Euler a",  # Literal['DPM++ 2M Karras', 'DPM++ SDE Karras', 'DPM++ 2M SDE Karras', 'Euler', 'Euler a', 'DDIM'] in 'Sampler' Dropdown component
+            "1024 x 1024",  # Literal['1024 x 1024', '1152 x 896', '896 x 1152', '1216 x 832', '832 x 1216', '1344 x 768', '768 x 1344', '1536 x 640', '640 x 1536', 'Custom'] in 'Aspect Ratio' Radio component
+            "(None)",  # Literal['(None)', 'Cinematic', 'Photographic', 'Anime', 'Manga', 'Digital Art', 'Pixel art', 'Fantasy art', 'Neonpunk', '3D Model'] in 'Style Preset' Radio component
+            "(None)",  # Literal['(None)', 'Standard v3.0', 'Standard v3.1', 'Light v3.1', 'Heavy v3.1'] in 'Quality Tags Presets' Dropdown component
+            True,  # bool in 'Use Upscaler' Checkbox component
+            0.5,  # float (numeric value between 0 and 1) in 'Strength' Slider component
+            1.5,  # float (numeric value between 1 and 1.5) in 'Upscale by' Slider component
+            True,  # bool in 'Add Quality Tags' Checkbox component
+            api_name="/run"
+        )
+
         # result[0] contains the list of generated images
         if result and len(result) > 0 and result[0]:
             image_data = result[0][0]['image']  # Get the first image
@@ -2116,12 +2142,18 @@ def main():
                 if filename.endswith('.json'):
                     try:
                         user_id = int(filename[:-5])  # Remove .json extension
+                        # Load the file to get current_history
+                        file_path = os.path.join(conversations_dir, filename)
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        current_history = data.get('current_history', 'default')
+                        
                         # Load conversation with current history
                         user_states[user_id] = {
                             "mode": "chat",
-                            "conversation": Conversation(user_id)  # Will load current history automatically
+                            "conversation": Conversation(user_id, current_history)
                         }
-                        logger.info(f"Loaded conversation for user {user_id}")
+                        logger.info(f"Loaded conversation for user {user_id} with history: {current_history}")
                     except Exception as e:
                         logger.error(f"Error loading conversation from {filename}: {e}")
 
