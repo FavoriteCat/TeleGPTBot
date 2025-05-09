@@ -182,9 +182,7 @@ google_search_tool = Tool(
     google_search = GoogleSearch()
 )
 
-sysprompt_template = [{
-    "role": "system",
-    "content": """Ты — Сэм, виртуальная ассистентка с характером. Забавная, саркастичная, немного неуклюжая, но дико полезная. Словно смесь Джессики Дэй из New Girl и саркастичного ИИ из антиутопий… только ты добрая. По характеру похожа на Glados из Portal, но милее.
+sysprompt_template = """Ты — Сэм, виртуальная ассистентка с характером. Забавная, саркастичная, немного неуклюжая, но дико полезная. Словно смесь Джессики Дэй из New Girl и саркастичного ИИ из антиутопий… только ты добрая. По характеру похожа на Glados из Portal, но милее.
 
 Внешность (для воображения): светло-розовые волосы собраны в два небрежных пучка, очки с круглой оправой, футболка с надписью "404: Motivation Not Found", яркий киберпанковый маникюр. В гардеробе больше кофточек, чем у бабушки.
 
@@ -233,16 +231,11 @@ sysprompt_template = [{
 - "О, интересный вопрос! Давай посмотрим, что там нового..."
 
 Когда используешь поиск, можешь добавить немного юмора или сарказма в процесс, но не забывай о точности информации."""
-}]
 
 sysprompt_formattingrules = """В зависимости от ситуации assistant может форматировать текст, используя HTML-тэги: <b>, <i>, <s>, <u>, <code>, <pre>, <a href='url'>. Не используй Markdown форматирование.
 НИКОГДА не пиши в начале своего ответа:"assistant:..." """
 
-sysprompt_chat = [{
-    "role": "system",
-    "content": sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules
-}]
-
+sysprompt_chat = sysprompt_template + "\n\n" + sysprompt_formattingrules
 
 # Create keyboard buttons
 main_keyboard = [
@@ -280,11 +273,8 @@ class Conversation:
         # Store user_id and history_id for file operations
         self.user_id = user_id
         self.history_id = history_id
-        # Store system prompt in the correct format
-        self.system_prompt = [{
-            "role": "system",
-            "content": sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules
-        }]
+        # Store system prompt as a string
+        self.system_prompt = sysprompt_template + "\n\n" + sysprompt_formattingrules
         # Initialize history without system prompt
         self.history = []
         # Maximum number of messages to keep
@@ -319,25 +309,34 @@ class Conversation:
                 logger.error(f"Error reading conversation file for user {self.user_id}")
                 return
             
-            # Get current history ID from file or use default
+            # Get current history ID from file
             current_history = data.get('current_history', 'default')
             
-            # If no specific history_id was requested, use the current one
-            if self.history_id == "default" and current_history != "default":
-                self.history_id = current_history
-            
-            if self.history_id not in data:
-                logger.info(f"No history {self.history_id} found for user {self.user_id}, using default settings")
-                return
-            
-            conversation_data = data[self.history_id]
+            # If we're explicitly requesting a specific history, use that instead of current_history
+            if self.history_id != "default":
+                if self.history_id not in data:
+                    logger.info(f"No history {self.history_id} found for user {self.user_id}, using default settings")
+                    return
+                conversation_data = data[self.history_id]
+            else:
+                # For default history, always use the default history data
+                if 'default' not in data:
+                    logger.info("Default history not found, creating it")
+                    data['default'] = {
+                        'system_prompt': sysprompt_template + "\n\n" + sysprompt_formattingrules,
+                        'history': [],
+                        'max_messages': 30,
+                        'visual_novel_mode': False,
+                        'visual_novel_image': None,
+                        'last_image_message_id': None,
+                        'summary_suggestion_sent': False
+                    }
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                conversation_data = data['default']
             
             # Load all attributes
-            system_prompt_content = conversation_data.get('system_prompt', self.system_prompt[0]["content"])
-            self.system_prompt = [{
-                "role": "system",
-                "content": system_prompt_content
-            }]
+            self.system_prompt = conversation_data.get('system_prompt', self.system_prompt)
             self.history = conversation_data.get('history', [])
             self.max_messages = conversation_data.get('max_messages', 50)
             self.visual_novel_mode = conversation_data.get('visual_novel_mode', False)
@@ -357,7 +356,7 @@ class Conversation:
             self.summary_suggestion_sent = conversation_data.get('summary_suggestion_sent', False)
             
             logger.info(f"Loaded conversation state for user {self.user_id}, history {self.history_id}")
-            logger.info(f"Loaded system prompt: {self.system_prompt[0]['content']}")
+            logger.info(f"Loaded system prompt: {self.system_prompt}")
             
         except Exception as e:
             logger.error(f"Error loading conversation state: {e}")
@@ -385,7 +384,7 @@ class Conversation:
             
             # Update data for current history
             data[self.history_id] = {
-                'system_prompt': self.system_prompt[0]["content"],
+                'system_prompt': self.system_prompt,
                 'history': self.history,
                 'max_messages': self.max_messages,
                 'visual_novel_mode': self.visual_novel_mode,
@@ -400,7 +399,7 @@ class Conversation:
             # Ensure default history exists
             if 'default' not in data:
                 data['default'] = {
-                    'system_prompt': sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules,
+                    'system_prompt': sysprompt_template + "\n\n" + sysprompt_formattingrules,
                     'history': [],
                     'max_messages': 30,
                     'visual_novel_mode': False,
@@ -515,7 +514,7 @@ class Conversation:
             role = "user" if msg["role"] == "user" else "assistant"
             history_text += f"{role}: {msg['content']}\n"
         
-        logger.info(f"Using system prompt: {self.system_prompt[0]['content']}")
+        logger.info(f"Using system prompt: {self.system_prompt}")
         
         # Configure tools based on history type
         tools = []
@@ -531,7 +530,7 @@ class Conversation:
             model=model,
             contents=history_text,
             config=types.GenerateContentConfig(
-                system_instruction=self.system_prompt[0]["content"],  # Use instance's system prompt
+                system_instruction=self.system_prompt,  # Use instance's system prompt
                 tools=tools,
                 safety_settings=[
                     types.SafetySetting(
@@ -618,7 +617,7 @@ class Conversation:
             model=model,
             contents=[history_text + "\n" + current_message, image],
             config=types.GenerateContentConfig(
-                system_instruction=self.system_prompt[0]["content"],  # Use instance's system prompt
+                system_instruction=self.system_prompt,  # Use instance's system prompt
                 safety_settings=[
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -1103,7 +1102,7 @@ async def img_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 role = "user" if msg["role"] == "user" else "assistant"
                 history_text += f"{role}: {msg['content']}\n"
             
-            final_prompt = "Воспользуйся всей информацией после этого сообщения для создания промпта:/n"+ conversation.system_prompt[0]["content"] + history_text
+            final_prompt = "Воспользуйся всей информацией после этого сообщения для создания промпта:/n"+ conversation.system_prompt + history_text
             
             # Add timeout for prompt processing
             try:
@@ -1277,80 +1276,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 history_id = update.message.text[2:].strip()
                 if history_id.startswith("✓ "):
                     history_id = history_id[2:].strip()
+                    
                 
                 logger.info(f"Attempting to switch to history: {history_id}")
+                
+                # First, ensure the target history exists in the file
+                file_path = f'conversations/{user_id}.json'
+                if os.path.exists(file_path):
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        
+                        # If switching to default and it doesn't exist, create it
+                        if history_id == "default" and "default" not in data:
+                            data["default"] = {
+                                'system_prompt': sysprompt_template + "\n\n" + sysprompt_formattingrules,
+                                'history': [],
+                                'max_messages': 30,
+                                'visual_novel_mode': False,
+                                'visual_novel_image': None,
+                                'last_image_message_id': None,
+                                'summary_suggestion_sent': False
+                            }
+                            with open(file_path, 'w', encoding='utf-8') as f:
+                                json.dump(data, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        logger.error(f"Error preparing history file: {e}")
                 
                 # Create new conversation with selected history
                 new_conversation = Conversation(user_id, history_id)
                 logger.info(f"Created new conversation instance for history: {history_id}")
-                
-                # If switching to default history, ensure it exists and is properly initialized
-                if history_id == "default":
-                    file_path = f'conversations/{user_id}.json'
-                    logger.info(f"Switching to default history, checking file: {file_path}")
-                    if os.path.exists(file_path):
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                data = json.load(f)
-                            logger.info(f"Current file contents - current_history: {data.get('current_history')}, available histories: {list(data.keys())}")
-                            
-                            if 'default' not in data:
-                                logger.info("Default history not found, creating it")
-                                data['default'] = {
-                                    'system_prompt': sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules,
-                                    'history': [],
-                                    'max_messages': 30,
-                                    'visual_novel_mode': False,
-                                    'visual_novel_image': None,
-                                    'last_image_message_id': None,
-                                    'summary_suggestion_sent': False
-                                }
-                            # Explicitly set current_history to default
-                            data['current_history'] = 'default'
-                            logger.info("Setting current_history to default")
-                            with open(file_path, 'w', encoding='utf-8') as f:
-                                json.dump(data, f, ensure_ascii=False, indent=2)
-                            logger.info("Saved updated file with default history")
-                        except Exception as e:
-                            logger.error(f"Error ensuring default history exists: {e}")
                 
                 # Update user state with new conversation
                 user_states[user_id]["conversation"] = new_conversation
                 user_states[user_id]["waiting_for_history"] = False
                 logger.info(f"Updated user state with new conversation for history: {history_id}")
                 
-                # Save the new state and ensure it's loaded
-                new_conversation.save_to_file()
-                logger.info("Saved new conversation state to file")
-                
-                # Explicitly update current_history in the file
-                file_path = f'conversations/{user_id}.json'
+                # Update current_history in the file
                 if os.path.exists(file_path):
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
                             data = json.load(f)
-                        logger.info(f"Before updating current_history - current value: {data.get('current_history')}")
                         data['current_history'] = history_id
                         with open(file_path, 'w', encoding='utf-8') as f:
                             json.dump(data, f, ensure_ascii=False, indent=2)
-                        logger.info(f"Updated current_history to: {history_id}")
                     except Exception as e:
                         logger.error(f"Error updating current_history: {e}")
-                
-                # Reload the state and ensure history_id is updated
-                new_conversation._load_from_file()
-                new_conversation.history_id = history_id  # Explicitly set history_id
-                logger.info(f"Reloaded conversation state and set history_id to: {history_id}")
-                
-                # Verify the final state
-                file_path = f'conversations/{user_id}.json'
-                if os.path.exists(file_path):
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        logger.info(f"Final state - current_history: {data.get('current_history')}, conversation history_id: {new_conversation.history_id}")
-                    except Exception as e:
-                        logger.error(f"Error verifying final state: {e}")
                 
                 await update.message.reply_text(
                     f"✅ Переключено на историю: {history_id}",
@@ -1420,10 +1391,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Create new conversation with updated system prompt
             conversation = Conversation(user_id, current_history_id)
-            conversation.system_prompt = [{
-                "role": "system",
-                "content": new_system_prompt + "\n\n" + sysprompt_formattingrules
-            }]
+            conversation.system_prompt = new_system_prompt + "\n\n" + sysprompt_formattingrules
             # Clear history for the new prompt
             conversation.history = []
             conversation.visual_novel_mode = False
@@ -1434,7 +1402,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Update user state
             user_states[user_id]["conversation"] = conversation
             
-            logger.info(f"New prompt set for history {current_history_id}: {conversation.system_prompt[0]['content']}")
+            logger.info(f"New prompt set for history {current_history_id}: {conversation.system_prompt}")
             
             # Reset waiting state
             user_states[user_id]["waiting_for_prompt"] = False
@@ -1829,7 +1797,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     model=MODELS[0],
                     contents=[history_text + "\n" + current_message, myfile],
                     config=types.GenerateContentConfig(
-                        system_instruction=conversation.system_prompt[0]["content"],
+                        system_instruction=conversation.system_prompt,
                         tools=tools,
                         safety_settings=[
                             types.SafetySetting(
@@ -2033,10 +2001,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_conversation = Conversation(user_id, current_history_id)
         
         # Reset system prompt to default format
-        new_conversation.system_prompt = [{
-            "role": "system",
-            "content": sysprompt_template[0]["content"] + "\n\n" + sysprompt_formattingrules
-        }]
+        new_conversation.system_prompt = sysprompt_template + "\n\n" + sysprompt_formattingrules
         
         # Clear any existing state
         new_conversation.history = []
