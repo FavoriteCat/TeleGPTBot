@@ -29,6 +29,7 @@ import atexit
 import signal
 import sys
 import platform
+import shutil
 
 # Configure logging
 logging.basicConfig(
@@ -920,80 +921,134 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def generate_image_huggingface(prompt: str) -> str:
     """Generate image using Gradio client"""
+    download_delay = 10  # seconds to wait before downloading
+    
     try:
         logger.info("Initializing Gradio client...")
         # client = GradioClient(
-        #     "Asahina2k/animagine-xl-4.0",
+        #     "Asahina2K/animagine-xl-3.1",
         #     hf_token=os.getenv('HUGGINGFACE_API_KEY')
         # )
-        
-        # Initialize API
-        # logger.info("Initializing API...")
-        # client.predict(api_name="/lambda")
-        
-        # Generate image
-        # fixed_prompt = prompt + ",masterpiece, high score, great score, absurdre"
-        # result = client.predict(
-        #     prompt=fixed_prompt,
-        #     negative_prompt="lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",
-        #     seed=0,
-        #     custom_width=1024,
-        #     custom_height=1024,
-        #     guidance_scale=5,
-        #     num_inference_steps=28,
-        #     sampler="Euler a",
-        #     aspect_ratio_selector="832 x 1216",
-        #     style_selector="(None)",
-        #     use_upscaler=False,
-        #     upscaler_strength=0.55,
-        #     upscale_by=1.5,
-        #     add_quality_tags=True,
-        #     api_name="/generate"
-        # )
-        
-        # # Finalize
-        # logger.info("Finalizing generation...")
-        # client.predict(api_name="/lambda_1")
-        
         client = GradioClient(
-            "Asahina2K/animagine-xl-3.1",
+            "gokaygokay/NoobAI-Animagine-T-ponynai3",
             hf_token=os.getenv('HUGGINGFACE_API_KEY')
         )
         logger.info("Initializing API...")
         fixed_prompt = prompt + ",masterpiece, high score, great score, absurdre"
-        result = await asyncio.to_thread(
-            client.predict,
-            fixed_prompt,  # str in 'Prompt' Textbox component
-            "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",  # str in 'Negative Prompt' Textbox component
-            0,  # float (numeric value between 0 and 2147483647) in 'Seed' Slider component
-            896,  # float (numeric value between 512 and 2048) in 'Width' Slider component
-            1152,  # float (numeric value between 512 and 2048) in 'Height' Slider component
-            7,  # float (numeric value between 1 and 12) in 'Guidance scale' Slider component
-            28,  # float (numeric value between 1 and 50) in 'Number of inference steps' Slider component
-            "Euler a",  # Literal['DPM++ 2M Karras', 'DPM++ SDE Karras', 'DPM++ 2M SDE Karras', 'Euler', 'Euler a', 'DDIM'] in 'Sampler' Dropdown component
-            "1024 x 1024",  # Literal['1024 x 1024', '1152 x 896', '896 x 1152', '1216 x 832', '832 x 1216', '1344 x 768', '768 x 1344', '1536 x 640', '640 x 1536', 'Custom'] in 'Aspect Ratio' Radio component
-            "(None)",  # Literal['(None)', 'Cinematic', 'Photographic', 'Anime', 'Manga', 'Digital Art', 'Pixel art', 'Fantasy art', 'Neonpunk', '3D Model'] in 'Style Preset' Radio component
-            "(None)",  # Literal['(None)', 'Standard v3.0', 'Standard v3.1', 'Light v3.1', 'Heavy v3.1'] in 'Quality Tags Presets' Dropdown component
-            True,  # bool in 'Use Upscaler' Checkbox component
-            0.5,  # float (numeric value between 0 and 1) in 'Strength' Slider component
-            1.5,  # float (numeric value between 1 and 1.5) in 'Upscale by' Slider component
-            True,  # bool in 'Add Quality Tags' Checkbox component
-            api_name="/run"
-        )
+        
+        # Wrap the predict call in a try-except to handle any Gradio client errors
+        try:
+            # result = await asyncio.to_thread(
+            #     client.predict,
+            #     fixed_prompt,  # str in 'Prompt' Textbox component
+            #     "lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",  # str in 'Negative Prompt' Textbox component
+            #     0,  # float (numeric value between 0 and 2147483647) in 'Seed' Slider component
+            #     896,  # float (numeric value between 512 and 2048) in 'Width' Slider component
+            #     1152,  # float (numeric value between 512 and 2048) in 'Height' Slider component
+            #     7,  # float (numeric value between 1 and 12) in 'Guidance scale' Slider component
+            #     28,  # float (numeric value between 1 and 50) in 'Number of inference steps' Slider component
+            #     "Euler a",  # Literal['DPM++ 2M Karras', 'DPM++ SDE Karras', 'DPM++ 2M SDE Karras', 'Euler', 'Euler a', 'DDIM'] in 'Sampler' Dropdown component
+            #     "1024 x 1024",  # Literal['1024 x 1024', '1152 x 896', '896 x 1152', '1216 x 832', '832 x 1216', '1344 x 768', '768 x 1344', '1536 x 640', '640 x 1536', 'Custom'] in 'Aspect Ratio' Radio component
+            #     "(None)",  # Literal['(None)', 'Cinematic', 'Photographic', 'Anime', 'Manga', 'Digital Art', 'Pixel art', 'Fantasy art', 'Neonpunk', '3D Model'] in 'Style Preset' Radio component
+            #     "(None)",  # Literal['(None)', 'Standard v3.0', 'Standard v3.1', 'Light v3.1', 'Heavy v3.1'] in 'Quality Tags Presets' Dropdown component
+            #     True,  # bool in 'Use Upscaler' Checkbox component
+            #     0.5,  # float (numeric value between 0 and 1) in 'Strength' Slider component
+            #     1.5,  # float (numeric value between 1 and 1.5) in 'Upscale by' Slider component
+            #     True,  # bool in 'Add Quality Tags' Checkbox component
+            #     api_name="/run"  # /run api
+            # )
+            result = await asyncio.to_thread(
+                client.predict,  # передаем сам метод
+                model_choice="Animagine XL 4.0",  # а аргументы передаем отдельно
+                additional_positive_prompt=fixed_prompt,
+                additional_negative_prompt="lowres, bad anatomy, bad hands, text, error, missing finger, extra digits, fewer digits, cropped, worst quality, low quality, low score, bad score, average score, signature, watermark, username, blurry",
+                height=1216,
+                width=832,
+                num_inference_steps=25,
+                guidance_scale=7,
+                num_images_per_prompt=1,
+                use_random_seed=True,
+                seed=0,
+                sampler="Euler a",
+                clip_skip=1,
+                use_florence2=False,
+                use_medium_enhancer=False,
+                use_long_enhancer=False,
+                use_positive_prefix=False,
+                use_positive_suffix=False,
+                use_negative_prefix=False,
+                use_negative_suffix=False,
+                input_image=None,
+                api_name="/generate_image"
+            )
+            
+            logger.info(f"Raw API response: {result}")
+            logger.info(f"Response type: {type(result)}")
+            if isinstance(result, (list, tuple)):
+                logger.info(f"Response length: {len(result)}")
+                for i, item in enumerate(result):
+                    logger.info(f"Item {i} type: {type(item)}")
+                    logger.info(f"Item {i} value: {item}")
 
-        # result[0] contains the list of generated images
-        if result and len(result) > 0 and result[0]:
-            image_data = result[0][0]['image']  # Get the first image
-            logger.info("Image generated successfully!")
-            return image_data  # This will be the path to the generated image
-        else:
-            raise Exception("No image generated")
+            # Проверяем формат результата
+            if not result or not isinstance(result, tuple) or len(result) < 1:
+                raise Exception("Не удалось получить изображение. Пожалуйста, попробуйте позже.")
+
+            # Получаем путь к изображению из первого элемента кортежа
+            image_data = result[0]
+            if not image_data or not isinstance(image_data, list) or len(image_data) < 1:
+                raise Exception("Не удалось получить данные изображения")
+
+            image_path = image_data[0].get('image')
+            if not image_path:
+                raise Exception("Не удалось получить путь к изображению")
+
+            logger.info(f"Image path: {image_path}")
+            
+            # Проверяем существование файла
+            if not os.path.exists(image_path):
+                raise Exception("Файл изображения не найден")
+
+            # Копируем файл во временную директорию
+            temp_path = f"temp_image_{int(time.time())}.jpg"
+            shutil.copy2(image_path, temp_path)
+            logger.info(f"Image copied to: {temp_path}")
+            
+            return temp_path
+        except Exception as e:
+            logger.error(f"Error during image generation: {str(e)}")
+            raise Exception("Извините, сервис генерации изображений временно недоступен. Пожалуйста, попробуйте позже.")
+
+        logger.info("Processing result...")
+        if not result or not isinstance(result, list) or len(result) == 0:
+            raise Exception("Не удалось получить изображение. Пожалуйста, попробуйте позже.")
+
+        image_url = result[0]
+        logger.info(f"Image URL generated: {image_url}")
+        
+        # Add longer delay before downloading to ensure file is ready
+        logger.info(f"Waiting {download_delay} seconds before downloading...")
+        await asyncio.sleep(download_delay)
+        
+        try:
+            # Download the image from URL with timeout
+            response = requests.get(image_url, timeout=30)
+            if response.status_code != 200:
+                raise Exception(f"Не удалось загрузить изображение (код ошибки: {response.status_code})")
+                
+            temp_path = f"temp_image_{int(time.time())}.jpg"
+            with open(temp_path, 'wb') as f:
+                f.write(response.content)
+            logger.info("Image downloaded successfully!")
+            return temp_path
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error while downloading: {str(e)}")
+            raise Exception("Не удалось загрузить изображение. Пожалуйста, попробуйте позже.")
             
     except Exception as e:
-        logger.error(f"Error generating image: {str(e)}")
-        if "timeout" in str(e).lower():
-            logger.error("SSL handshake timeout. This might be due to network issues or proxy settings.")
-        raise Exception(f"Failed to generate image: {str(e)}")
+        logger.error(f"Error in image generation: {str(e)}")
+        raise Exception("Произошла ошибка при создании изображения. Пожалуйста, попробуйте позже.")
 
 async def generate_image_flux(prompt: str) -> str:
     """Generate image using Flux models, trying each model in sequence until success."""
@@ -1573,23 +1628,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     gpt_response = conversation.get_response(update.message.text, model)
                 # Handle image message
                 elif update.message.photo:
-                    # Get the largest photo
-                    photo = update.message.photo[-1]
-                    # Download the photo
-                    photo_file = await context.bot.get_file(photo.file_id)
-                    photo_path = f"temp_{photo.file_id}.jpg"
-                    await photo_file.download_to_drive(photo_path)
+                    file = await context.bot.get_file(update.message.photo[-1].file_id)
+                    image_path = f"image_{update.message.photo[-1].file_id}.jpg"
+                    try:
+                        await file.download_to_drive(image_path)
+                        # Проверяем, что файл существует и не пустой
+                        if os.path.exists(image_path) and os.path.getsize(image_path) > 0:
+                            # Продолжаем обработку
+                            ...
+                        else:
+                            raise Exception("Downloaded file is empty or does not exist")
+                    except Exception as e:
+                        logger.error(f"Error downloading image: {e}")
+                        await update.message.reply_text(
+                            "Извините, не удалось загрузить изображение.",
+                            reply_markup=main_reply_markup,
+                            parse_mode="HTML"
+                        )
+                        return
                     
                     # Get response with image analysis
                     gpt_response = conversation.get_response_with_image(
-                        photo_path, 
+                        image_path, 
                         update.message.caption or "Расскажи об этом изображении", 
                         model
                     )
                     
                     # Clean up
                     try:
-                        os.remove(photo_path)
+                        os.remove(image_path)
                     except Exception as e:
                         logger.error(f"Error removing temporary file: {e}")
                 else:
@@ -1768,20 +1835,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Upload file to Google Gemini with timeout
         try:
-            myfile = await asyncio.wait_for(
-                asyncio.to_thread(client.files.upload, file=ogg_path),
-                timeout=30  # 30 seconds timeout for upload
-            )
-        except asyncio.TimeoutError:
-            logger.error("Timeout while uploading voice file to Gemini")
-            await update.message.reply_text(
-                "Извините, превышено время ожидания при обработке голосового сообщения.",
-                reply_markup=main_reply_markup,
-                parse_mode="HTML"
-            )
-            return
+            with open(ogg_path, 'rb') as audio_file:
+                audio_data = audio_file.read()
+                myfile = types.Content(
+                    parts=[
+                        types.Part(
+                            inline_data=types.Blob(
+                                mime_type="audio/ogg",
+                                data=audio_data
+                            )
+                        )
+                    ]
+                )
         except Exception as e:
-            logger.error(f"Error uploading voice file to Gemini: {e}")
+            logger.error(f"Error reading audio file: {e}")
             await update.message.reply_text(
                 "Извините, произошла ошибка при обработке голосового сообщения.",
                 reply_markup=main_reply_markup,
@@ -1817,11 +1884,32 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             dynamic_threshold=0.96))
                 )]
             
+            # Формируем историю в правильном формате
+            contents = []
+            for msg in conversation.history:
+                if msg["role"] == "system":
+                    continue
+                role = "user" if msg["role"] == "user" else "model"  # Используем "model" вместо "assistant"
+                contents.append(types.Content(
+                    parts=[types.Part(text=msg["content"])],
+                    role=role
+                ))
+
+            # Добавляем текущее сообщение с аудио
+            contents.append(types.Content(
+                parts=[
+                    types.Part(text=current_message),
+                    types.Part(inline_data=types.Blob(mime_type="audio/ogg", data=audio_data))
+                ],
+                role="user"
+            ))
+        # contents=[history_text + "\n" + current_message, myfile],
+            # Отправляем запрос
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.models.generate_content,
                     model=MODELS[0],
-                    contents=[history_text + "\n" + current_message, myfile],
+                    contents=contents,
                     config=types.GenerateContentConfig(
                         system_instruction=conversation.system_prompt,
                         tools=tools,
@@ -1845,7 +1933,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ]
                     )
                 ),
-                timeout=60  # 60 seconds timeout for response
+                timeout=60
             )
             
             if not response or not response.text:

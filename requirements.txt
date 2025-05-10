@@ -1,3 +1,5 @@
-python-telegram-bot==12.8
+python-telegram-bot==22.0
 python-dotenv==1.0.0
 gradio_client>=0.10.0 
+g4f[all]
+google-genai
